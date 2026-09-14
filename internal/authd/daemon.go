@@ -13,6 +13,12 @@
 // 重认证 = 确保 CAS TGC 有效（失效则用配置里的账密重新登录并持久化）
 // 再走 CAS → ePortal 委托认证。认证成功但探针仍不通视为上游故障，
 // 进入长退避，避免 logout/login 死循环。
+//
+// 凭据类硬失败（密码错误、强制验证码、二次认证）不再退避重试：用同一套
+// 错误凭据反复提交只会累积服务端失败计数，把账号刷进验证码/临时冻结。
+// 此类错误使 Run 返回 ErrHardAuthFailure，由 main 以 EX_CONFIG 退出，
+// 等人工修正配置后重启。CAS 账密提交步骤的连续失败另有熔断兜底，
+// 防止服务端变更响应结构导致凭据拒绝被误分类后无限重试。
 package authd
 
 import (
@@ -29,6 +35,23 @@ import (
 	"ysunethelper/internal/logx"
 	"ysunethelper/internal/probe"
 )
+
+// ErrHardAuthFailure 表示凭据类不可恢复失败： daemon 应退出等人工干预，
+// 而不是用同一套凭据重试（会累积服务端失败计数，触发账号风控）。
+// main 将其映射为 EX_CONFIG(78) 退出码，systemd/OpenRC 均不会自动重启。
+var ErrHardAuthFailure = errors.New("authd: unrecoverable credential failure")
+
+// maxConsecutiveLoginFails 是 CAS 账密提交步骤的连续失败熔断阈值。
+// 兜底场景：服务端变更响应结构导致凭据拒绝被误分类（如 401 曾被当作
+// 协议错误），达到阈值即按硬失败处理，避免无限刷服务端失败计数。
+const maxConsecutiveLoginFails = 3
+
+// loginError 标记失败发生在 CAS 账密提交步骤（区别于其后的 ePortal 准入）。
+// 只有这一步的失败会消耗服务端的账号失败计数，熔断只对它计数。
+type loginError struct{ err error }
+
+func (e *loginError) Error() string { return "CAS 登录失败: " + e.err.Error() }
+func (e *loginError) Unwrap() error { return e.err }
 
 // State 是 Daemon 的观测状态。
 type State string
@@ -53,6 +76,7 @@ type Daemon struct {
 	state         State
 	backoff       time.Duration
 	postAuthFails int
+	loginFails    int // 连续 CAS 账密提交失败计数（熔断用，认证成功时清零）
 }
 
 // New 构造 Daemon。cfg 必须已 ApplyDefaults。
@@ -91,7 +115,7 @@ func Authenticate(ctx context.Context, cfg *config.Config, casClient *cas.Client
 	}
 	if !ok {
 		if err := casClient.Login(ctx, cfg.Username, cfg.Password); err != nil {
-			return nil, err
+			return nil, &loginError{err}
 		}
 		if err := casClient.SaveCredential(cfg.CredentialPath); err != nil {
 			// 持久化失败不阻断本次认证，但下次还得重登
@@ -101,7 +125,7 @@ func Authenticate(ctx context.Context, cfg *config.Config, casClient *cas.Client
 	return portal.LoginViaCAS(ctx, casClient, cfg.Service)
 }
 
-// Run 运行 Daemon 主循环，直到 ctx 取消。
+// Run 运行 Daemon 主循环，直到 ctx 取消或发生凭据类硬失败（ErrHardAuthFailure）。
 func (d *Daemon) Run(ctx context.Context) error {
 	d.log.Info("daemon started",
 		"service", d.cfg.Service,
@@ -113,14 +137,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.log.Info("daemon stopped")
 			return nil
 		}
-		d.tick(ctx)
+		if err := d.tick(ctx); err != nil {
+			return err
+		}
 	}
 }
 
 // tick 执行一轮判定链，并睡到下一轮。
-func (d *Daemon) tick(ctx context.Context) {
+// 返回非 nil 错误表示不可恢复的硬失败，Run 应退出。
+func (d *Daemon) tick(ctx context.Context) error {
 	if d.pauseAuthentication(ctx) {
-		return
+		return nil
 	}
 
 	// 1. Internet 探针：通则在线，慢速轮询
@@ -129,15 +156,15 @@ func (d *Daemon) tick(ctx context.Context) {
 		d.backoff = d.cfg.Daemon.BackoffInitial.D()
 		d.postAuthFails = 0
 		d.sleep(ctx, d.cfg.Daemon.ProbeInterval.D())
-		return
+		return nil
 	}
 
 	// 2. 防抖：连续确认 N 次都失败才动作
 	if !d.confirmOffline(ctx) {
-		return // 确认期间探针恢复，本轮结束（下一轮重新判定）
+		return nil // 确认期间探针恢复，本轮结束（下一轮重新判定）
 	}
 	if d.pauseAuthentication(ctx) {
-		return
+		return nil
 	}
 
 	// 3. 查 portal 状态，区分假死/真掉线/不在校园网
@@ -147,15 +174,15 @@ func (d *Daemon) tick(ctx context.Context) {
 			d.setState(StateNoLink)
 			d.log.Warn("portal 不可达，可能不在校园网", "err", err)
 			d.sleep(ctx, d.cfg.Daemon.NoLinkInterval.D())
-			return
+			return nil
 		}
 		d.log.Error("查询 portal 状态失败", "err", err)
 		d.sleepBackoff(ctx)
-		return
+		return nil
 	}
 	// 查询可能跨过时段边界，必须在主动下线前再次检查。
 	if d.pauseAuthentication(ctx) {
-		return
+		return nil
 	}
 	d.setState(StateOffline)
 	if status.Online {
@@ -171,18 +198,18 @@ func (d *Daemon) tick(ctx context.Context) {
 
 	// 4. 认证
 	if d.pauseAuthentication(ctx) {
-		return
+		return nil
 	}
 	_, err = Authenticate(ctx, d.cfg, d.cas, d.portal)
 	if err != nil {
-		d.handleAuthError(ctx, err)
-		return
+		return d.handleAuthError(ctx, err)
 	}
+	d.loginFails = 0
 	d.log.Info("认证流程完成，验证 Internet 连通性")
 
 	// 5. 认证后验证：仍不通则是上游故障，长退避防 logout/login 死循环
 	if d.pauseAuthentication(ctx) {
-		return
+		return nil
 	}
 	if d.prober.Online(ctx) {
 		d.setState(StateOnline)
@@ -190,7 +217,7 @@ func (d *Daemon) tick(ctx context.Context) {
 		d.postAuthFails = 0
 		d.log.Info("Internet 连通，恢复在线")
 		d.sleep(ctx, d.cfg.Daemon.ProbeInterval.D())
-		return
+		return nil
 	}
 	d.postAuthFails++
 	if d.postAuthFails >= 2 {
@@ -198,10 +225,11 @@ func (d *Daemon) tick(ctx context.Context) {
 			"backoff", d.cfg.Daemon.BackoffMax.D().String())
 		d.postAuthFails = 0
 		d.sleep(ctx, d.cfg.Daemon.BackoffMax.D())
-		return
+		return nil
 	}
 	d.log.Warn("认证成功但 Internet 未通，稍后重试")
 	d.sleepBackoff(ctx)
+	return nil
 }
 
 // confirmOffline 连续确认探针失败；期间恢复则返回 false。
@@ -227,16 +255,19 @@ func (d *Daemon) confirmOffline(ctx context.Context) bool {
 }
 
 // handleAuthError 按错误类别决定退避策略。
-func (d *Daemon) handleAuthError(ctx context.Context, err error) {
+// 返回非 nil 错误（ErrHardAuthFailure）表示凭据类硬失败，daemon 应退出
+// 等人工修正配置：用同一套错误凭据退避重试只会累积服务端失败计数，
+// 把账号刷进强制验证码/临时冻结。
+func (d *Daemon) handleAuthError(ctx context.Context, err error) error {
 	switch {
 	case errors.Is(err, cas.ErrLoginFailed):
-		d.log.Error("CAS 登录被拒绝：用户名或密码错误（如密码已改请更新配置），进入长退避",
-			"err", err, "backoff", d.cfg.Daemon.BackoffMax.D().String())
-		d.sleep(ctx, d.cfg.Daemon.BackoffMax.D())
+		d.log.Error("CAS 拒绝登录：用户名或密码错误，停止自动重试。请修正配置中的账密后重启 daemon",
+			"err", err)
+		return fmt.Errorf("%w: %w", ErrHardAuthFailure, err)
 	case errors.Is(err, cas.ErrNeedCaptcha), errors.Is(err, cas.ErrMFARequired):
-		d.log.Error("CAS 要求验证码/二次认证（通常因频繁失败触发），请人工登录一次后重启 daemon",
-			"err", err, "backoff", d.cfg.Daemon.BackoffMax.D().String())
-		d.sleep(ctx, d.cfg.Daemon.BackoffMax.D())
+		d.log.Error("CAS 要求验证码/二次认证（通常因多次失败触发风控），无法无人值守处理，停止自动重试。"+
+			"请人工登录一次解除风控、确认配置账密后重启 daemon", "err", err)
+		return fmt.Errorf("%w: %w", ErrHardAuthFailure, err)
 	case errors.Is(err, cas.ErrIPBlocked):
 		d.log.Error("IP 被认证网关冻结，进入长退避",
 			"backoff", d.cfg.Daemon.BackoffMax.D().String())
@@ -246,9 +277,21 @@ func (d *Daemon) handleAuthError(ctx context.Context, err error) {
 		d.log.Warn("认证期间网络不可达", "err", err)
 		d.sleep(ctx, d.cfg.Daemon.NoLinkInterval.D())
 	default:
+		// 未识别的失败：若发生在 CAS 账密提交步骤则计入熔断——可能是
+		// 服务端变更导致的凭据拒绝误分类，刷满阈值即按硬失败退出。
+		var le *loginError
+		if errors.As(err, &le) {
+			d.loginFails++
+			if d.loginFails >= maxConsecutiveLoginFails {
+				d.log.Error("CAS 登录连续失败且原因无法识别（疑似凭据被拒），触发熔断停止重试。"+
+					"请检查配置账密后重启 daemon", "count", d.loginFails, "err", err)
+				return fmt.Errorf("%w: %w", ErrHardAuthFailure, err)
+			}
+		}
 		d.log.Error("认证失败", "err", err, "next_backoff", d.backoff.String())
 		d.sleepBackoff(ctx)
 	}
+	return nil
 }
 
 // setState 记录状态迁移日志。

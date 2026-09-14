@@ -65,3 +65,15 @@ func TestPageClassifiers(t *testing.T) {
 		t.Error("login page misclassified")
 	}
 }
+
+func TestNeedsCaptcha(t *testing.T) {
+	if !NeedsCaptcha(`<script>var needCaptcha = "true";</script>`) {
+		t.Error("needCaptcha=true not detected")
+	}
+	if NeedsCaptcha(`<script>var needCaptcha = "";</script>`) {
+		t.Error("empty needCaptcha misclassified")
+	}
+	if NeedsCaptcha(loginPageFixture) {
+		t.Error("login page misclassified")
+	}
+}

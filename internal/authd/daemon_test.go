@@ -3,6 +3,8 @@ package authd
 import (
 	"bufio"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -10,7 +12,9 @@ import (
 	"testing/synctest"
 	"time"
 
+	"ysunethelper/internal/cas"
 	"ysunethelper/internal/config"
+	"ysunethelper/internal/eportal"
 	"ysunethelper/internal/logx"
 	"ysunethelper/internal/probe"
 )
@@ -140,4 +144,53 @@ func TestDaemonNoAuthPeriodCancellation(t *testing.T) {
 			t.Fatal("cancellation waited for restricted period to end")
 		}
 	})
+}
+
+// 凭据类硬失败必须使 daemon 退出（ErrHardAuthFailure），不再退避重试。
+func TestHandleAuthErrorHardFailure(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.ApplyDefaults()
+	d := &Daemon{cfg: cfg, log: logx.New(io.Discard, logx.LevelInfo)}
+	for _, err := range []error{
+		fmt.Errorf("%w: 您提供的用户名或者密码有误", cas.ErrLoginFailed),
+		cas.ErrNeedCaptcha,
+		cas.ErrMFARequired,
+	} {
+		got := d.handleAuthError(context.Background(), err)
+		if !errors.Is(got, ErrHardAuthFailure) {
+			t.Fatalf("%v: got %v, want ErrHardAuthFailure", err, got)
+		}
+		if !errors.Is(got, err) {
+			t.Fatalf("%v: wrapped sentinel lost in %v", err, got)
+		}
+	}
+}
+
+// CAS 账密提交步骤的未识别失败累计到阈值触发熔断；其他步骤的失败不触发。
+func TestHandleAuthErrorLoginFuse(t *testing.T) {
+	newDaemon := func() *Daemon {
+		cfg := &config.Config{}
+		cfg.ApplyDefaults()
+		cfg.Daemon.BackoffInitial = config.Duration(time.Millisecond)
+		return &Daemon{cfg: cfg, log: logx.New(io.Discard, logx.LevelInfo), backoff: time.Millisecond}
+	}
+	loginErr := func() error { return &loginError{fmt.Errorf("%w: odd", cas.ErrProtocol)} }
+
+	d := newDaemon()
+	for i := 1; i < maxConsecutiveLoginFails; i++ {
+		if err := d.handleAuthError(context.Background(), loginErr()); err != nil {
+			t.Fatalf("attempt %d: got hard failure %v, want backoff", i, err)
+		}
+	}
+	if err := d.handleAuthError(context.Background(), loginErr()); !errors.Is(err, ErrHardAuthFailure) {
+		t.Fatalf("fuse did not trip at %d attempts, got %v", maxConsecutiveLoginFails, err)
+	}
+
+	d2 := newDaemon()
+	for i := 0; i < maxConsecutiveLoginFails+2; i++ {
+		if err := d2.handleAuthError(context.Background(),
+			fmt.Errorf("%w: odd", eportal.ErrProtocol)); err != nil {
+			t.Fatalf("non-login-step failure wrongly tripped fuse: %v", err)
+		}
+	}
 }

@@ -165,7 +165,9 @@ func (c *Client) classifyStep1Response(ctx context.Context, resp *http.Response)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	// 金智 CAS 第一重失败返回 401 + 登录页（错误提示在页面内），
+	// 与 200 错误页走同一解析路径；其余状态码才是协议异常。
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusUnauthorized {
 		return fmt.Errorf("%w: unexpected status code from CAS: %d", ErrProtocol, resp.StatusCode)
 	}
 	text, err := httpkit.ReadString(resp)
@@ -177,6 +179,12 @@ func (c *Client) classifyStep1Response(ctx context.Context, resp *http.Response)
 		return ErrIPBlocked
 	case IsReauthPage(text):
 		return ErrMFARequired
+	case NeedsCaptcha(text):
+		// 账号已被强制图形验证码，无人值守无法继续；附上错误文案便于排查
+		if msg := ExtractErrorMessage(text); msg != "" {
+			return fmt.Errorf("%w: %s", ErrNeedCaptcha, msg)
+		}
+		return ErrNeedCaptcha
 	}
 	if msg := ExtractErrorMessage(text); msg != "" {
 		// 服务端常用同一 element 提示「需要验证码」与「用户名密码错」，按关键词区分

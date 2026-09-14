@@ -87,6 +87,15 @@ func IsIPFrozen(htmlText string) bool {
 	return containsAny(htmlText, ipFrozenKw)
 }
 
+var needCaptchaRE = regexp.MustCompile(`needCaptcha\s*=\s*"true"`)
+
+// NeedsCaptcha 报告登录页 JS 变量 needCaptcha 是否为 "true"。
+// 金智 CAS 在账号累计失败达到阈值后置位（_badCredentialsCount 为阈值），
+// 此后任何登录提交都强制图形验证码，比解析错误文案更可靠。
+func NeedsCaptcha(htmlText string) bool {
+	return needCaptchaRE.MatchString(htmlText)
+}
+
 func containsAny(s string, kws []string) bool {
 	for _, k := range kws {
 		if strings.Contains(s, k) {

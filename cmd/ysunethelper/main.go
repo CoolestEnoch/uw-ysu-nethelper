@@ -221,6 +221,13 @@ func cmdDaemon(ctx context.Context, cfg *config.Config, verbose bool) {
 	log := logx.New(os.Stdout, level)
 	d := authd.New(cfg, log)
 	if err := d.Run(ctx); err != nil {
+		if errors.Is(err, authd.ErrHardAuthFailure) {
+			// 与配置不完整共用 EX_CONFIG(78)：systemd 单元的
+			// RestartPreventExitStatus=78 与 OpenRC（无 respawn）
+			// 都不会自动重启，等人工修正配置后手动拉起。
+			fmt.Fprintf(os.Stderr, "ysunethelper: %v\n", err)
+			os.Exit(configExitCode)
+		}
 		fatal("daemon 异常退出: %v", err)
 	}
 }
